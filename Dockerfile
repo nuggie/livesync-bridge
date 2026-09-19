@@ -1,13 +1,18 @@
-FROM denoland/deno:2.3.1
+FROM docker.io/denoland/deno:2.6.9
 
 WORKDIR /app
+RUN chown deno:deno /app
+RUN mkdir -p /deno-dir/location_data && chown deno:deno /deno-dir/location_data
+
+USER deno
 
 VOLUME /app/dat
 VOLUME /app/data
 
-COPY . .
+COPY --chown=deno:deno . .
 
-RUN deno install -A
+# Deno 2.x: install the exact dependencies recorded in deno.lock. Runtime
+# permissions remain attached to `deno task run` rather than the install step.
+RUN deno install --frozen
 
 CMD [ "deno", "task", "run" ]
-

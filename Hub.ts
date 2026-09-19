@@ -1,5 +1,5 @@
 import { Config, FileData } from "./types.ts";
-import { Peer } from "./Peer.ts";
+import { Peer, PeerHealth } from "./Peer.ts";
 import { PeerStorage } from "./PeerStorage.ts";
 import { PeerCouchDB } from "./PeerCouchDB.ts";
 
@@ -9,6 +9,16 @@ export class Hub {
     peers = [] as Peer[];
     constructor(conf: Config) {
         this.conf = conf;
+    }
+    // Aggregate peer health for the heartbeat. `ok` = every peer syncing (also
+    // false if no peers were constructed). `restartWorthy` = any peer judges itself
+    // restart-worthy (was healthy, now persistently failing while its backend is
+    // up) — see Peer.probeHealth.
+    async healthProbe(): Promise<{ ok: boolean; restartWorthy: boolean; peers: PeerHealth[] }> {
+        const peers = await Promise.all(this.peers.map((p) => p.probeHealth()));
+        const ok = peers.length > 0 && peers.every((p) => p.ok);
+        const restartWorthy = peers.some((p) => p.restartWorthy);
+        return { ok, restartWorthy, peers };
     }
     start() {
         for (const p of this.peers) {
@@ -26,9 +36,26 @@ export class Hub {
                 throw new Error(`Unexpected Peer type: ${(peer as any)?.name} - ${(peer as any)?.type}`);
             }
         }
-        for (const p of this.peers) {
-            p.start();
-        }
+        // Initialize couchdb peers FIRST and await them, then start storage peers.
+        // Otherwise a storage peer's offline scan can push to a couchdb peer before its
+        // DB managers are initialized (initializeDatabase), causing
+        // "Cannot read properties of undefined (reading 'getDBEntryMeta')".
+        (async () => {
+            for (const p of this.peers) {
+                if (p.config.type === "couchdb") {
+                    await p.start().catch((e) => {
+                        console.error(`[Hub] peer "${p.config.name}" start() failed:`, e);
+                    });
+                }
+            }
+            for (const p of this.peers) {
+                if (p.config.type !== "couchdb") {
+                    p.start().catch((e) => {
+                        console.error(`[Hub] peer "${p.config.name}" start() failed:`, e);
+                    });
+                }
+            }
+        })();
     }
 
     async dispatch(source: Peer, path: string, data: FileData | false) {
@@ -49,4 +76,3 @@ export class Hub {
         }
     }
 }
-

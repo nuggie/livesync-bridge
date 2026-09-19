@@ -1,16 +1,20 @@
-import { LOG_LEVEL_INFO, LOG_LEVEL_NOTICE, LOG_LEVEL_VERBOSE } from "./lib/src/common/types.ts";
 import { PeerStorageConf, FileData } from "./types.ts";
-import { Logger } from "./lib/src/common/logger.ts";
-import { delay, getDocData } from "./lib/src/common/utils.ts";
-import { isPlainText } from "./lib/src/string_and_binary/path.ts";
+import { delay, getDocData } from "@vrtmrz/livesync-commonlib/compat/common/utils";
+import { isPlainText } from "@vrtmrz/livesync-commonlib/compat/string_and_binary/path";
 import { parse, format, relative, dirname, resolve } from "@std/path";
-import { format as posixFormat, parse as posixParse } from "@std/path/posix"
+import { format as posixFormat, parse as posixParse } from "@std/path/posix";
 import { scheduleOnceIfDuplicated } from "octagonal-wheels/concurrency/lock";
-import { DispatchFun, Peer } from "./Peer.ts";
+import { DispatchFun, Peer, PeerHealth } from "./Peer.ts";
 import chokidar from "chokidar";
-import { walk } from 'fs/walk';
+import { walk } from "fs/walk";
 
 import { scheduleTask } from "octagonal-wheels/concurrency/task";
+import {
+    Logger,
+    LOG_LEVEL_INFO,
+    LOG_LEVEL_NOTICE,
+    LOG_LEVEL_VERBOSE,
+} from "octagonal-wheels/common/logger";
 
 export class PeerStorage extends Peer {
     declare config: PeerStorageConf;
@@ -153,6 +157,16 @@ export class PeerStorage extends Peer {
     }
     watcher?: chokidar.FSWatcher;
 
+    private async closeChokidarWatcher(watcher?: chokidar.FSWatcher): Promise<void> {
+        if (!watcher) return;
+        try {
+            await watcher.close();
+        } catch (ex) {
+            // Chokidar may already have closed the watcher after an error.
+            Logger(ex, LOG_LEVEL_VERBOSE);
+        }
+    }
+
     async dispatch(pathSrc: string) {
         const lP = this.toStoragePath(this.toLocalPath("."));
         const path = this.toPosixPath(relative(lP, pathSrc));
@@ -251,8 +265,14 @@ export class PeerStorage extends Peer {
 
     async startDenoFsWatch(): Promise<void> {
         if (this.watcherDeno) {
-            this.watcherDeno.close();
+            const watcher = this.watcherDeno;
             this.watcherDeno = undefined;
+            try {
+                watcher.close();
+            } catch (ex) {
+                // Closing a watcher more than once is harmless for its lifecycle.
+                Logger(ex, LOG_LEVEL_VERBOSE);
+            }
         }
         const lP = this.toStoragePath(this.toLocalPath("."));
         this.normalLog(`Scan offline changes: ${this.config.scanOfflineChanges ? "Enabled, now starting..." : "Disabled"}`);
@@ -267,13 +287,26 @@ export class PeerStorage extends Peer {
                 }
             }
         }
-        this.watcherDeno = Deno.watchFs(lP,
+        const watcher = Deno.watchFs(lP,
             {
                 recursive: true,
             });
+        this.watcherDeno = watcher;
 
-        for await (const event of this.watcherDeno) {
-            this.processFile(event);
+        try {
+            for await (const event of watcher) {
+                this.processFile(event);
+            }
+        } finally {
+            if (this.watcherDeno === watcher) {
+                this.watcherDeno = undefined;
+            }
+            try {
+                watcher.close();
+            } catch (ex) {
+                // The watcher can already be closed by stop() or a concurrent start().
+                Logger(ex, LOG_LEVEL_VERBOSE);
+            }
         }
 
     }
@@ -285,20 +318,28 @@ export class PeerStorage extends Peer {
         }
 
         if (this.watcher) {
-            this.watcher.close();
+            const watcher = this.watcher;
             this.watcher = undefined;
+            await this.closeChokidarWatcher(watcher);
         }
         const lP = this.toStoragePath(this.toLocalPath("."));
         this.normalLog(`Scan offline changes: ${this.config.scanOfflineChanges ? "Enabled, now starting..." : "Disabled"}`);
-        this.watcher = chokidar.watch(lP,
+        const watcher = chokidar.watch(lP,
             {
                 ignoreInitial: !this.config.scanOfflineChanges,
                 awaitWriteFinish: {
                     stabilityThreshold: 500,
                 },
             });
+        this.watcher = watcher;
 
-        this.watcher.on("change", async (path) => {
+        watcher.on("error", (ex) => {
+            if (this.watcher !== watcher) return;
+            this.watcher = undefined;
+            Logger(ex, LOG_LEVEL_NOTICE);
+            void this.closeChokidarWatcher(watcher);
+        });
+        watcher.on("change", async (path) => {
             const ePath = this.toPosixPath(relative(this.toLocalPath("."), path));
             if (!await this.isChanged(ePath)) {
                 // this.debugLog(`Not changed: ${ePath}`);
@@ -307,7 +348,7 @@ export class PeerStorage extends Peer {
                 await this.dispatch(path);
             }
         })
-        this.watcher.on("add", async (path) => {
+        watcher.on("add", async (path) => {
             const ePath = this.toPosixPath(relative(this.toLocalPath("."), path));
             if (!await this.isChanged(ePath)) {
                 // this.debugLog(`Not changed: ${ePath}`);
@@ -316,16 +357,32 @@ export class PeerStorage extends Peer {
                 await this.dispatch(path);
             }
         })
-        this.watcher.on("unlink", async (path) => {
+        watcher.on("unlink", async (path) => {
             const ePath = this.toPosixPath(relative(this.toLocalPath("."), path));
             this.debugLog(`Unlink detected: ${ePath}`);
             await this.dispatchDeleted(path)
         })
     }
     async stop() {
-        this.watcher?.close();
-        this.watcherDeno?.close();
+        const watcher = this.watcher;
+        this.watcher = undefined;
+        const watcherDeno = this.watcherDeno;
         this.watcherDeno = undefined;
-        return await Promise.resolve();
+        if (watcherDeno) {
+            try {
+                watcherDeno.close();
+            } catch (ex) {
+                // The Deno iterator cleanup can close the watcher a second time.
+                Logger(ex, LOG_LEVEL_VERBOSE);
+            }
+        }
+        await this.closeChokidarWatcher(watcher);
+    }
+    override health(): PeerHealth {
+        const ok = !!(this.watcherDeno || this.watcher);
+        // No remote backend (backendUp always true). A storage peer still doing its
+        // initial offline scan is "starting", not yet healthy, so the base restart
+        // logic won't flag it — only a watcher that dies after being healthy counts.
+        return { name: this.config.name, type: "storage", ok, detail: ok ? "watching" : "starting", backendUp: true, restartWorthy: false };
     }
 }

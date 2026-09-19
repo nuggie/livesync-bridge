@@ -1,29 +1,69 @@
-import { DirectFileManipulator, FileInfo, MetaEntry, ReadyEntry } from "./lib/src/API/DirectFileManipulatorV2.ts";
-import { FilePathWithPrefix, LOG_LEVEL_NOTICE, MILESTONE_DOCID, TweakValues } from "./lib/src/common/types.ts";
+import { DirectFileManipulator } from "@vrtmrz/livesync-commonlib";
+import {
+    type FilePathWithPrefix,
+    MILESTONE_DOCID,
+    type TweakValues,
+} from "@vrtmrz/livesync-commonlib/compat/common/types";
 import { PeerCouchDBConf, FileData } from "./types.ts";
-import { decodeBinary } from "./lib/src/string_and_binary/convert.ts";
-import { isPlainText } from "./lib/src/string_and_binary/path.ts";
-import { DispatchFun, Peer } from "./Peer.ts";
-import { createBinaryBlob, createTextBlob, isDocContentSame, unique } from "./lib/src/common/utils.ts";
+import { decodeBinary } from "@vrtmrz/livesync-commonlib/compat/string_and_binary/convert";
+import { isPlainText } from "@vrtmrz/livesync-commonlib/compat/string_and_binary/path";
+import { DispatchFun, Peer, PeerHealth } from "./Peer.ts";
+import {
+    createBinaryBlob,
+    createTextBlob,
+    isDocContentSame,
+    unique,
+} from "@vrtmrz/livesync-commonlib/compat/common/utils";
+import { minimatch } from "minimatch";
+import { promiseWithResolver } from "octagonal-wheels/promises";
+import { LOG_LEVEL_NOTICE } from "octagonal-wheels/common/logger";
 import { withRetry } from "./util.ts";
+
+type ManipulatorMetaEntry = Parameters<DirectFileManipulator["getByMeta"]>[0];
+type ManipulatorReadyEntry = Awaited<ReturnType<DirectFileManipulator["getByMeta"]>>;
 
 // export class PeerInstance()
 
 export class PeerCouchDB extends Peer {
-    man: DirectFileManipulator;
+    man!: DirectFileManipulator;
     declare config: PeerCouchDBConf;
+    private _started = promiseWithResolver<void>();
+    private _connected = false;
+    private _remoteEmpty = false;
     constructor(conf: PeerCouchDBConf, dispatcher: DispatchFun) {
         super(conf, dispatcher);
-        this.man = new DirectFileManipulator(conf);
+        // The manipulator is built lazily in start(), only after a probe confirms
+        // CouchDB is reachable. Building it here would start its one-shot init
+        // against a possibly-down CouchDB, then discard and rebuild it on the
+        // first successful connection.
+    }
+    // (Re)create the underlying DirectFileManipulator. Its constructor starts a
+    // one-shot async database initialisation. Recovering from a failed attempt
+    // requires a fresh manipulator because its `ready` promise remains settled.
+    private _buildManipulator(): void {
+        // Release the previous instance if we're rebuilding. Each retry that gets
+        // past the probe but fails to connect (CouchDB reachable but e.g. a config
+        // error) rebuilds; without this the old manipulator's local DB handle would
+        // leak. Best-effort and fire-and-forget — it may be mid-init, and we don't
+        // want to block the connect path (or fail it) on teardown.
+        const prev = this.man as DirectFileManipulator | undefined;
+        this.man = new DirectFileManipulator(this.config, {
+            // Bypass node:http compatibility shims for Deno, Traefik, and long-polling connections.
+            fetch: (request, init) => globalThis.fetch(request, init),
+        });
         // Fetch remote since.
         this.man.since = this.getSetting("since") || "now";
+        if (prev) void prev.close().catch(() => {});
     }
     async delete(pathSrc: string): Promise<boolean> {
+        await this._started.promise;
         const path = this.toLocalPath(pathSrc);
         if (await this.isRepeating(pathSrc, false)) {
             return false;
         }
         try {
+            // Retry only the network call. The isRepeating() dedup guard above must NOT
+            // be re-run on retry, or the retry would be swallowed as a duplicate.
             const r = await withRetry(() => this.man.delete(path), {
                 label: `delete ${path}`,
                 attempts: 10,
@@ -44,12 +84,13 @@ export class PeerCouchDB extends Peer {
         }
     }
     async put(pathSrc: string, data: FileData): Promise<boolean> {
+        await this._started.promise;
         const path = this.toLocalPath(pathSrc);
         if (await this.isRepeating(pathSrc, data)) {
             return false;
         }
         const type = isPlainText(path) ? "plain" : "newnote";
-        const info: FileInfo = {
+        const info = {
             ctime: data.ctime,
             mtime: data.mtime,
             size: data.size
@@ -60,7 +101,7 @@ export class PeerCouchDB extends Peer {
             // dedup guard above must NOT be re-run on retry, or the retry would be
             // swallowed as a duplicate and the change silently lost.
             return await withRetry(async () => {
-                const old = await this.man.get(path as FilePathWithPrefix, true) as false | MetaEntry;
+                const old = await this.man.get(path as FilePathWithPrefix, true) as false | ManipulatorMetaEntry;
                 // const old = await this.getMeta(path as FilePathWithPrefix);
                 if (old && Math.abs(this.compareDate(info, old)) < 3600) {
                     const oldDoc = await this.man.getByMeta(old);
@@ -93,8 +134,9 @@ export class PeerCouchDB extends Peer {
         }
     }
     async get(pathSrc: FilePathWithPrefix): Promise<false | FileData> {
+        await this._started.promise;
         const path = this.toLocalPath(pathSrc) as FilePathWithPrefix;
-        const ret = await this.man.get(path) as false | ReadyEntry;
+        const ret = await this.man.get(path) as false | ManipulatorReadyEntry;
         if (ret === false) {
             return false;
         }
@@ -107,8 +149,9 @@ export class PeerCouchDB extends Peer {
         };
     }
     async getMeta(pathSrc: FilePathWithPrefix): Promise<false | FileData> {
+        await this._started.promise;
         const path = this.toLocalPath(pathSrc) as FilePathWithPrefix;
-        const ret = await this.man.get(path, true) as false | MetaEntry;
+        const ret = await this.man.get(path, true) as false | ManipulatorMetaEntry;
         if (ret === false) {
             return false;
         }
@@ -120,125 +163,180 @@ export class PeerCouchDB extends Peer {
             deleted: ret.deleted
         };
     }
-    /** Wait until the manipulator's DB connection is ready. If the initial
-     * connection died (e.g. DNS/WAN was down at boot), its `ready` promise never
-     * resolves, so recreate the manipulator and try again instead of hanging or
-     * crashing. */
-    async ensureReady(): Promise<void> {
-        for (let attempt = 1; ; attempt++) {
-            const ready = await Promise.race([
-                this.man.ready.promise.then(() => true, () => false),
-                new Promise<boolean>((r) => setTimeout(() => r(false), 30000)),
-            ]);
-            if (ready) return;
-            this.normalLog(
-                `CouchDB connection not ready (attempt ${attempt}) — recreating manipulator and retrying…`,
-                LOG_LEVEL_NOTICE,
-            );
-            this.man = new DirectFileManipulator(this.config);
-            this.man.since = this.getSetting("since") || "now";
+    // Probe CouchDB the same way PouchDB will: a request whose body must parse as
+    // JSON. A half-ready CouchDB (or a proxy error page) returns a non-JSON body —
+    // exactly the case that used to crash the bridge — so we treat it as "not
+    // ready yet" and let the caller retry, fast, instead of waiting on a hung init.
+    private async _probeCouch(timeoutMs = 10000): Promise<void> {
+        // Read straight from config (the manipulator may not be built yet, and these
+        // are the same credentials it will use).
+        const url = `${this.config.url}/${this.config.database}`;
+        const headers: Record<string, string> = {};
+        if (this.config.username) {
+            // UTF-8-safe Basic auth: btoa() throws on code points > 0xFF, so a
+            // non-ASCII password would otherwise make every probe fail forever even
+            // though CouchDB would accept it.
+            const creds = `${this.config.username}:${this.config.password ?? ""}`;
+            const b64 = btoa(String.fromCharCode(...new TextEncoder().encode(creds)));
+            headers["Authorization"] = `Basic ${b64}`;
+        }
+        // Bounded so a hung connection can't stall either the connect loop or the
+        // heartbeat's reachability check (which would look like a wedged process).
+        const res = await globalThis.fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
+        if (!res.ok) {
+            await res.body?.cancel();
+            throw new Error(`CouchDB not ready: HTTP ${res.status}`);
+        }
+        await res.json();
+    }
+
+    // Is CouchDB up and serving right now? Uses the same success threshold as the
+    // connect probe (200 + parseable JSON), so a still-warming-up CouchDB (refused,
+    // or 503) reads as down — we don't want a restart while it boots.
+    private async _couchReachable(): Promise<boolean> {
+        try {
+            await this._probeCouch(5000);
+            return true;
+        } catch {
+            return false;
         }
     }
+
+    // Bound the manipulator's one-shot initialisation so a transport which accepts
+    // the request but never answers becomes a retriable failure.
+    private _waitReady(timeoutMs: number): Promise<void> {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error("CouchDB init timed out")), timeoutMs);
+        });
+        return Promise.race([this.man.ready.promise as Promise<void>, timeout]).finally(() => {
+            if (timer !== undefined) clearTimeout(timer);
+        });
+    }
+
     async start(): Promise<void> {
-        // start() is invoked un-awaited by Hub.start(); any throw here would be an
-        // unhandled rejection and kill the daemon. Retry indefinitely instead — a
-        // WAN/DNS outage just delays startup until the network returns.
-        for (let attempt = 1; ; attempt++) {
+        let attempt = 0;
+        // Supervised connect loop. CouchDB may be unreachable or still warming up
+        // (classically right after a host reboot, when CouchDB and the bridge start
+        // together). Rather than letting a failed connect surface as a fatal
+        // unhandled rejection — which crash-looped the bridge into systemd's start
+        // limit and left it down for days — retry with capped backoff until CouchDB
+        // answers, then begin watching.
+        for (;;) {
             try {
-                await this._start();
+                await this._probeCouch();
+                // CouchDB answered cleanly; rebuild against it so init starts fresh.
+                this._buildManipulator();
+                await this._connectAndWatch();
+                if (attempt > 0) {
+                    this.normalLog(`Connected to CouchDB after ${attempt} retr${attempt === 1 ? "y" : "ies"}.`, LOG_LEVEL_NOTICE);
+                }
+                this._connected = true;
+                this._started.resolve();
                 return;
-            } catch (ex) {
-                this.normalLog(
-                    `start() failed (attempt ${attempt}): ${(ex as Error)?.message ?? ex}. Retrying in 15s`,
-                    LOG_LEVEL_NOTICE,
-                );
-                await new Promise((r) => setTimeout(r, 15000));
+            } catch (e) {
+                attempt++;
+                const delay = Math.min(30000, 1000 * 2 ** Math.min(attempt - 1, 5));
+                this.normalLog(`CouchDB connect attempt ${attempt} failed; retrying in ${delay / 1000}s.`, LOG_LEVEL_NOTICE);
+                this.debugLog(`${e instanceof Error ? (e.stack ?? e.message) : e}`);
+                await new Promise((r) => setTimeout(r, delay));
             }
         }
     }
-    async _start(): Promise<void> {
-        const baseDir = this.toLocalPath("");
-        await this.ensureReady();
-        const w = await withRetry(() => this.man.rawGet<Record<string, any>>(MILESTONE_DOCID), {
-            label: "fetch milestone",
-            attempts: 10,
-            onRetry: (m) => this.normalLog(m, LOG_LEVEL_NOTICE),
-        });
-        if (w && "tweak_values" in w) {
-            if (this.config.useRemoteTweaks) {
-                const tweaks = Object.values(w["tweak_values"])[0] as TweakValues;
-                // console.log(tweaks)
-                const orgConf = { ...this.config } as Record<string, any>;
-                this.config.customChunkSize = tweaks.customChunkSize ?? this.config.customChunkSize;
-                this.config.minimumChunkSize = tweaks.minimumChunkSize ?? this.config.minimumChunkSize;
-                if (tweaks.encrypt && !this.config.passphrase) {
-                    throw new Error("Remote database is encrypted but no passphrase provided.");
-                }
-                if (tweaks.usePathObfuscation && !this.config.obfuscatePassphrase) {
-                    throw new Error("Remote database is obfuscated but no obfuscate passphrase provided.");
-                }
-                this.config.hashAlg = tweaks.hashAlg ?? this.config.hashAlg;
-                this.config.maxAgeInEden = tweaks.maxAgeInEden ?? this.config.maxAgeInEden;
-                this.config.maxTotalLengthInEden = tweaks.maxTotalLengthInEden ?? this.config.maxTotalLengthInEden;
-                this.config.maxChunksInEden = tweaks.maxChunksInEden ?? this.config.maxChunksInEden;
-                this.config.useEden = tweaks.useEden ?? this.config.useEden;
-                if (!this.config.enableCompression != !tweaks.enableCompression) {
-                    throw new Error("Compression setting mismatched.");
-                }
-                this.config.useDynamicIterationCount = tweaks.useDynamicIterationCount ?? this.config.useDynamicIterationCount;
-                this.config.enableChunkSplitterV2 = tweaks.enableChunkSplitterV2 ?? this.config.enableChunkSplitterV2;
-                this.config.chunkSplitterVersion = tweaks.chunkSplitterVersion ?? this.config.chunkSplitterVersion;
-                this.config.E2EEAlgorithm = tweaks.E2EEAlgorithm ?? this.config.E2EEAlgorithm;
-                this.config.minimumChunkSize = tweaks.minimumChunkSize ?? this.config.minimumChunkSize;
-                this.config.customChunkSize = tweaks.customChunkSize ?? this.config.customChunkSize;
-                this.config.doNotUseFixedRevisionForChunks = tweaks.doNotUseFixedRevisionForChunks ?? this.config.doNotUseFixedRevisionForChunks;
-                this.config.handleFilenameCaseSensitive = tweaks.handleFilenameCaseSensitive ?? this.config.handleFilenameCaseSensitive;
-                const newConf = { ...this.config } as Record<string, any>;
-                this.man.options = this.config;
-                await this.man.liveSyncLocalDB.initializeDatabase()
-                // await this.man.managers.initManagers();
-                const diff = unique([...Object.keys(orgConf), ...Object.keys(tweaks)]).filter(k => orgConf[k] != newConf[k]);
-                if (diff.length > 0) {
-                    this.normalLog(`Remote tweaks changed --->`);
-                    for (const diffKey of diff) {
-                        this.normalLog(`${diffKey}\t: ${orgConf[diffKey]} \t : ${newConf[diffKey]}`);
+
+    private async _connectAndWatch(): Promise<void> {
+        {
+            const baseDir = this.toLocalPath("");
+            await this._waitReady(15000);
+            const w = await this.man.rawGet<Record<string, any>>(MILESTONE_DOCID);
+            if (w && "tweak_values" in w) {
+                if (this.config.useRemoteTweaks) {
+                    const tweaks = Object.values(w["tweak_values"])[0] as TweakValues;
+                    // console.log(tweaks)
+                    const orgConf = { ...this.config } as Record<string, any>;
+                    this.config.customChunkSize = tweaks.customChunkSize ?? this.config.customChunkSize;
+                    this.config.minimumChunkSize = tweaks.minimumChunkSize ?? this.config.minimumChunkSize;
+                    if (tweaks.encrypt && !this.config.passphrase) {
+                        throw new Error("Remote database is encrypted but no passphrase provided.");
                     }
-                    this.normalLog(`<--- Remote tweaks changed`);
+                    if (tweaks.usePathObfuscation && !this.config.obfuscatePassphrase) {
+                        throw new Error("Remote database is obfuscated but no obfuscate passphrase provided.");
+                    }
+                    this.config.hashAlg = tweaks.hashAlg ?? this.config.hashAlg;
+                    this.config.maxAgeInEden = tweaks.maxAgeInEden ?? this.config.maxAgeInEden;
+                    this.config.maxTotalLengthInEden = tweaks.maxTotalLengthInEden ?? this.config.maxTotalLengthInEden;
+                    this.config.maxChunksInEden = tweaks.maxChunksInEden ?? this.config.maxChunksInEden;
+                    this.config.useEden = tweaks.useEden ?? this.config.useEden;
+                    if (!this.config.enableCompression != !tweaks.enableCompression) {
+                        throw new Error("Compression setting mismatched.");
+                    }
+                    this.config.useDynamicIterationCount = tweaks.useDynamicIterationCount ?? this.config.useDynamicIterationCount;
+                    this.config.enableChunkSplitterV2 = tweaks.enableChunkSplitterV2 ?? this.config.enableChunkSplitterV2;
+                    this.config.chunkSplitterVersion = tweaks.chunkSplitterVersion ?? this.config.chunkSplitterVersion;
+                    this.config.E2EEAlgorithm = tweaks.E2EEAlgorithm ?? this.config.E2EEAlgorithm;
+                    this.config.minimumChunkSize = tweaks.minimumChunkSize ?? this.config.minimumChunkSize;
+                    this.config.customChunkSize = tweaks.customChunkSize ?? this.config.customChunkSize;
+                    this.config.doNotUseFixedRevisionForChunks = tweaks.doNotUseFixedRevisionForChunks ?? this.config.doNotUseFixedRevisionForChunks;
+                    this.config.handleFilenameCaseSensitive = tweaks.handleFilenameCaseSensitive ?? this.config.handleFilenameCaseSensitive;
+                    const newConf = { ...this.config } as Record<string, any>;
+                    this.man.options = this.config;
+                    await this.man.liveSyncLocalDB.initializeDatabase()
+                    // await this.man.managers.initManagers();
+                    const diff = unique([...Object.keys(orgConf), ...Object.keys(tweaks)]).filter(k => orgConf[k] != newConf[k]);
+                    if (diff.length > 0) {
+                        this.normalLog(`Remote tweaks changed --->`);
+                        for (const diffKey of diff) {
+                            this.normalLog(`${diffKey}\t: ${orgConf[diffKey]} \t : ${newConf[diffKey]}`);
+                        }
+                        this.normalLog(`<--- Remote tweaks changed`);
+                    }
                 }
             }
-        }
-        if (!w) {
-            this.normalLog(`Remote database looks like empty. fetch from the first.`);
-            this.setSetting("remote-created", "0");
-            return;
-        }
-        const created = w.created;
-        if (this.getSetting("remote-created") !== `${created}`) {
-            this.man.since = "";
-            this.normalLog(`Remote database looks like rebuilt. fetch from the first again.`);
-            this.setSetting("remote-created", `${created}`);
-        } else {
-            this.normalLog(`Watch starting from ${this.man.since}`);
-        }
-        this.man.beginWatch(async (entry) => {
-            const d = entry.type == "plain" ? entry.data : new Uint8Array(decodeBinary(entry.data));
-            let path = entry.path.substring(baseDir.length);
-            if (path.startsWith("/")) {
-                path = path.substring(1);
+            if (!w) {
+                this.normalLog(`Remote database looks like empty. fetch from the first.`);
+                this.setSetting("remote-created", "0");
+                // Connected fine; there's just nothing to watch yet. Mark it so health
+                // counts this as syncing rather than a stuck "not watching" state.
+                this._remoteEmpty = true;
+                return;
             }
-            if (entry.deleted || entry._deleted) {
-                this.sendLog(`${path} delete detected`);
-                await this.dispatchDeleted(path);
+            const created = w.created;
+            if (this.getSetting("remote-created") !== `${created}`) {
+                this.man.since = "";
+                this.normalLog(`Remote database looks like rebuilt. fetch from the first again.`);
+                this.setSetting("remote-created", `${created}`);
             } else {
-                const docData = { ctime: entry.ctime, mtime: entry.mtime, size: entry.size, deleted: entry.deleted || entry._deleted, data: d };
-                this.sendLog(`${path} change detected`);
-                await this.dispatch(path, docData);
+                this.normalLog(`Watch starting from ${this.man.since}`);
             }
-        }, (entry) => {
-            this.setSetting("since", this.man.since);
-            if (entry.path.indexOf(":") !== -1) return false;
-            return entry.path.startsWith(baseDir);
-        });
+            this.man.beginWatch(async (entry) => {
+                const d = entry.type == "plain" ? entry.data : new Uint8Array(decodeBinary(entry.data));
+                let path = entry.path.substring(baseDir.length);
+                if (path.startsWith("/")) {
+                    path = path.substring(1);
+                }
+                if (path.startsWith("i:")) {
+                    path = path.substring(2);
+                }
+                if (entry.deleted || entry._deleted) {
+                    this.sendLog(`${path} delete detected`);
+                    await this.dispatchDeleted(path);
+                } else {
+                    const docData = { ctime: entry.ctime, mtime: entry.mtime, size: entry.size, deleted: entry.deleted || entry._deleted, data: d };
+                    this.sendLog(`${path} change detected`);
+                    await this.dispatch(path, docData);
+                }
+            }, (entry) => {
+                this.setSetting("since", this.man.since);
+                if (entry.path.indexOf(":") !== -1) {
+                    if (this.config.includeInternal && entry.path.startsWith("i:")) {
+                        const stripped = entry.path.substring(2);
+                        return this.config.includeInternal.some(pattern => minimatch(stripped, pattern, { dot: true }));
+                    }
+                    return false;
+                }
+                return entry.path.startsWith(baseDir);
+            });
+        }
     }
     async dispatch(path: string, data: FileData | false) {
         if (data === false) return;
@@ -255,7 +353,31 @@ export class PeerCouchDB extends Peer {
         }
     }
     async stop(): Promise<void> {
-        this.man.endWatch();
+        // `man` may not exist yet if stop() races a still-connecting start().
+        this.man?.endWatch();
         return await Promise.resolve();
+    }
+    // Synchronous snapshot. `ok` means actually syncing — connected AND either
+    // watching or a known-empty remote. A brief `watching` dip during the 10s
+    // self-healing reconnect makes ok=false, but the Quadlet healthcheck's retry
+    // window (3 × 30s) absorbs that, so it doesn't cause a restart. backendUp is
+    // only asserted here when we're syncing; probeHealth() refines it otherwise.
+    override health(): PeerHealth {
+        const watching = this.man?.watching === true;
+        const syncing = this._connected && (watching || this._remoteEmpty);
+        return {
+            name: this.config.name,
+            type: "couchdb",
+            ok: syncing,
+            detail: !this._connected ? "connecting" : (watching ? "watching" : (this._remoteEmpty ? "connected (empty remote)" : "reconnecting")),
+            backendUp: syncing,
+            restartWorthy: false,
+        };
+    }
+    // Backend reachability for the base restart logic — probe CouchDB (bounded). The
+    // base only calls this once a peer has been healthy and is now failing, so a
+    // CouchDB outage (probe fails → backendUp false) keeps the peer non-restart-worthy.
+    override checkBackendUp(): Promise<boolean> {
+        return this._couchReachable();
     }
 }

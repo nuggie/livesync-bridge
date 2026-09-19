@@ -1,4 +1,4 @@
-import type { DirectFileManipulatorOptions } from "./lib/src/API/DirectFileManipulator.ts";
+import type { DirectFileManipulatorOptions } from "@vrtmrz/livesync-commonlib";
 
 export interface Config {
     peers: PeerConf[];
@@ -18,6 +18,8 @@ export interface PeerStorageConf {
     useChokidar?: boolean;
 }
 export interface PeerCouchDBConf extends DirectFileManipulatorOptions {
+    /** Glob patterns for i:-prefixed (internal) files to sync, e.g. [".claude/**"] */
+    includeInternal?: string[];
     type: "couchdb";
     useRemoteTweaks?: true;
     group?: string;

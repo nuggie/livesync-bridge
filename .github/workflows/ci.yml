@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  deno-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Install dependencies
+        run: deno install --frozen
+
+      - name: Check
+        run: deno task check
+
+      - name: Lint
+        run: deno task lint
+
+      - name: Test
+        run: deno task test
+
+      - name: Start CouchDB
+        run: docker compose -f test/integration/compose.yml up --detach --wait
+
+      - name: Test CouchDB integration
+        run: deno task test:integration
+
+      - name: Stop CouchDB
+        if: always()
+        run: docker compose -f test/integration/compose.yml down --volumes

@@ -23,7 +23,7 @@ Of course, it is multi-directional!
 1. Clone the GitHub Repository
 
 ```git
-git clone --recursive https://github.com/vrtmrz/livesync-bridge
+git clone https://github.com/vrtmrz/livesync-bridge
 ```
 
 2. Open the config file dat/config.sample.json, edit and save to
@@ -54,6 +54,68 @@ git clone https://github.com/vrtmrz/livesync-bridge
 docker compose up -d
 ```
 
+The Compose configuration stores Deno's `localStorage` data, which offline
+scans use to identify changed files, in the named volume
+`bridge_local_storage`. Keep this volume when recreating containers. Running
+`docker compose down --volumes` removes it, so the next offline scan must
+rebuild this data.
+
+### Choosing where scan state is stored
+
+The named volume is the default because it preserves the scan state across
+container recreation without requiring a host path. You can replace it with a
+bind mount if you prefer to manage this data on the host. Create a
+`docker-compose.local.yml` file containing:
+
+```yaml
+services:
+  bridge:
+    volumes:
+      - type: bind
+        source: ./dat/location_data
+        target: /deno-dir/location_data
+        bind:
+          create_host_path: false
+```
+
+Create the source directory before starting the bridge:
+
+```bash
+mkdir -p dat/location_data
+docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
+```
+
+On Linux, ensure that the directory is writable by UID and GID `1993:1993`,
+which the current image uses for the `deno` user. Files below `dat/` are
+already excluded from this repository by `.gitignore`.
+
+For host-managed temporary storage, use a path below `/tmp` instead, for
+example:
+
+```yaml
+source: /tmp/livesync-bridge-location_data
+```
+
+Create this directory and give the `deno` user write access before starting
+the bridge. Its lifetime depends on the host's `/tmp` clean-up policy; it can
+remain after the container is removed.
+
+For state which should last only as long as the container, replace the bind
+mount above with a memory-backed `tmpfs` mount:
+
+```yaml
+services:
+  bridge:
+    volumes:
+      - type: tmpfs
+        target: /deno-dir/location_data
+        tmpfs:
+          mode: 0o1777
+```
+
+The contents of this mount are lost when the container stops or is recreated,
+so the next offline scan must rebuild the state.
+
 
 # Configuration
 
@@ -73,8 +135,9 @@ The configuration file consists of the following structure.
       "customChunkSize": 100,
       "minimumChunkSize": 20,
       "passphrase": "passphrase", // E2EE passphrase, if you do not enabled, leave it blank.
-      "obfuscatePassphrase": "passphrase", // Path obfuscation passphrase, if you do not enabled, leave it blank. if enabled, set the same value of passphrase.
+      "obfuscatePassphrase": "passphrase", // Path obfuscation passphrase. Leave blank to disable it; this may differ from passphrase.
       "baseDir": "blog/", // Sharing folder
+      "includeInternal": [".claude/**"], // Opt-in glob patterns for internal/hidden files (see caution below). Omit to keep the default of skipping them.
       "useRemoteTweaks":true // Overwrite customChunkSize or minimumChunkSize, and check configuration matches
     },
     {
@@ -108,6 +171,27 @@ The configuration file consists of the following structure.
   ]
 }
 ```
+
+## Synchronising internal/hidden files
+
+By default, the bridge skips all of Self-hosted LiveSync's internal documents — the ones stored with an `i:` prefix, such as files inside hidden folders like `.obsidian/`, `.claude/`, and other tool configuration directories. These are normally left out of the sync.
+
+The optional `includeInternal` field opts specific internal paths back in. It takes an array of [minimatch](https://github.com/isaacs/minimatch) glob patterns that are matched against the path **after** the `i:` prefix is stripped:
+
+```jsonc
+{
+  "type": "couchdb",
+  "name": "test1",
+  // ...
+  "baseDir": "blog/",
+  "includeInternal": [".claude/**"] // Sync everything under .claude/
+}
+```
+
+A document is included when its de-prefixed path matches any one of the patterns. Patterns are matched with the `dot` option, so leading-dot folders such as `.claude/` are matched as expected.
+
+> [!CAUTION]
+> This synchronises files that are normally hidden and internal. Such folders often hold tool configuration that can contain machine-specific paths, local settings, or secrets. Only include patterns you genuinely intend to share, and review what they match before enabling. The option is opt-in: leave it out to keep the default behaviour, where all internal/hidden files are skipped.
 
 ## Realistic example
 
@@ -164,7 +248,7 @@ Totally, all files are synchronized like this:
       "username": "cornbread",
       "password": "tackle",
       "passphrase": "glucose", // E2EE passphrase, if you do not enabled, leave it blank.
-      "obfuscatePassphrase": "glucose", // Path obfuscation passphrase, if you do not enabled, leave it blank. if enabled, set the same value of passphrase.
+      "obfuscatePassphrase": "glucose", // Path obfuscation passphrase. Leave blank to disable it; this may differ from passphrase.
       "customChunkSize": 100,
       "minimumChunkSize": 20,
       "baseDir": "shared/" // Sharing folder
@@ -177,7 +261,7 @@ Totally, all files are synchronized like this:
       "username": "common_user",
       "password": "resu_nommoc",
       "passphrase": "cocoa", // E2EE passphrase, if you do not enabled, leave it blank.
-      "obfuscatePassphrase": "cocoa", // Path obfuscation passphrase, if you do not enabled, leave it blank. if enabled, set the same value of passphrase.
+      "obfuscatePassphrase": "cocoa", // Path obfuscation passphrase. Leave blank to disable it; this may differ from passphrase.
       "customChunkSize": 100,
       "minimumChunkSize": 20,
       "baseDir": "" // Sharing folder
