@@ -9,6 +9,18 @@ defaultLoggerEnv.minLogLevel = LOG_LEVEL_DEBUG;
 const configFile = Deno.env.get(`${KEY}CONFIG`) || "./dat/config.json";
 
 console.log("LiveSync Bridge is now starting...");
+
+// Resilience backstop: a WAN blip reloads Unbound on the router; the internal
+// CouchDB name (docker.developage.lan, TTL~1) is then briefly unresolvable and
+// an in-flight fetch rejects. Previously such an "Uncaught (in promise)
+// FetchError" killed the whole process -> systemd restart loop -> missed
+// offline changes / data loss. Keep the daemon alive and let the per-operation
+// retries (PeerCouchDB) recover once the network returns.
+globalThis.addEventListener("unhandledrejection", (e: PromiseRejectionEvent) => {
+    e.preventDefault();
+    console.error("[resilience] Unhandled rejection suppressed to keep bridge alive:", e.reason);
+});
+
 let config: Config = { peers: [] };
 const flags = parseArgs(Deno.args, {
     boolean: ["reset"],
