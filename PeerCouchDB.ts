@@ -308,7 +308,7 @@ export class PeerCouchDB extends Peer {
             } else {
                 this.normalLog(`Watch starting from ${this.man.since}`);
             }
-            this.man.beginWatch(async (entry) => {
+            this.man.beginWatch(async (entry, seq) => {
                 const d = entry.type == "plain" ? entry.data : new Uint8Array(decodeBinary(entry.data));
                 let path = entry.path.substring(baseDir.length);
                 if (path.startsWith("/")) {
@@ -325,8 +325,10 @@ export class PeerCouchDB extends Peer {
                     this.sendLog(`${path} change detected`);
                     await this.dispatch(path, docData);
                 }
+                // Only after the change has been handed to the hub: a crash before
+                // this point re-delivers the change on restart instead of losing it.
+                this._advanceSince(seq);
             }, (entry) => {
-                this.setSetting("since", this.man.since);
                 if (entry.path.indexOf(":") !== -1) {
                     if (this.config.includeInternal && entry.path.startsWith("i:")) {
                         const stripped = entry.path.substring(2);
@@ -337,6 +339,20 @@ export class PeerCouchDB extends Peer {
                 return entry.path.startsWith(baseDir);
             });
         }
+    }
+    // Persist the position in the CouchDB changes feed. The library never updates
+    // `man.since` on its own -- it only hands `seq` to the watch callback -- so the
+    // bridge used to persist the literal "now" forever. Every restart, and every
+    // library-internal reconnect after a feed error (which resumes from `man.since`),
+    // therefore started at "now" and silently skipped whatever changed in between
+    // (incident 2026-09-22: ~20 h of edits from Thorsten's devices never arrived).
+    // Note: change handlers run concurrently, so a later seq can be stored before an
+    // earlier one finished; a crash in that window could skip that one change. That
+    // is far narrower than the old behaviour and acceptable for a notes vault.
+    _advanceSince(seq?: string | number): void {
+        if (seq === undefined || seq === null || `${seq}` === "") return;
+        this.man.since = `${seq}`;
+        this.setSetting("since", `${seq}`);
     }
     async dispatch(path: string, data: FileData | false) {
         if (data === false) return;
