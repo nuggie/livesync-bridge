@@ -1,7 +1,7 @@
 import { PeerStorageConf, FileData } from "./types.ts";
 import { delay, getDocData } from "@vrtmrz/livesync-commonlib/compat/common/utils";
 import { isPlainText } from "@vrtmrz/livesync-commonlib/compat/string_and_binary/path";
-import { parse, format, relative, dirname, resolve } from "@std/path";
+import { parse, format, relative, dirname, resolve, SEPARATOR, isAbsolute } from "@std/path";
 import { format as posixFormat, parse as posixParse } from "@std/path/posix";
 import { scheduleOnceIfDuplicated } from "octagonal-wheels/concurrency/lock";
 import { DispatchFun, Peer, PeerHealth } from "./Peer.ts";
@@ -18,6 +18,8 @@ import {
 
 export class PeerStorage extends Peer {
     declare config: PeerStorageConf;
+    // The platform's path separator; a field so tests can simulate Windows on any OS.
+    pathSeparator: string = SEPARATOR;
 
 
     constructor(conf: PeerStorageConf, dispatcher: DispatchFun) {
@@ -25,9 +27,14 @@ export class PeerStorage extends Peer {
     }
 
     async delete(pathSrc: string): Promise<boolean> {
+        if (this.isUnsafeVaultPath(pathSrc)) {
+            this.normalLog(`Delete skipped: ${pathSrc} (the path contains the local path separator)`, LOG_LEVEL_NOTICE);
+            return false;
+        }
         const lp = this.toLocalPath(pathSrc);
         const path = this.toStoragePath(lp);
-        if (await this.isRepeating(lp, false)) {
+        // Keyed by the vault path, like dispatchDeleted(), so the resulting watcher event is a repeat.
+        if (await this.isRepeating(pathSrc, false)) {
             return false;
         }
         try {
@@ -42,13 +49,38 @@ export class PeerStorage extends Peer {
         return true;
     }
     async put(pathSrc: string, data: FileData): Promise<boolean> {
-        const lp = this.toLocalPath(pathSrc);
-        const path = this.toStoragePath(lp);
-        if (await this.isRepeating(lp, data)) {
-            this.receiveLog(`${lp} save repeating`);
+        if (this.isUnsafeVaultPath(pathSrc)) {
+            this.normalLog(`Write skipped: ${pathSrc} (the path contains the local path separator)`, LOG_LEVEL_NOTICE);
             return false;
         }
+        const lp = this.toLocalPath(pathSrc);
+        const path = this.toStoragePath(lp);
         try {
+            const incoming = data.data instanceof Uint8Array
+                ? data.data
+                : new TextEncoder().encode(getDocData(data.data));
+            // Preserve existing content when an empty payload conflicts with its reported size.
+            // Check before recording repeats so a later valid empty update can still be saved.
+            if (incoming.byteLength === 0 && data.size > 0) {
+                let existingSize = -1;
+                try {
+                    existingSize = (await Deno.stat(path)).size;
+                } catch (_e) {
+                    existingSize = -1;
+                }
+                if (existingSize > 0) {
+                    this.normalLog(
+                        `Empty write blocked: ${lp} (${existingSize} bytes on disk, ${data.size} bytes reported, 0 bytes received)`,
+                        LOG_LEVEL_NOTICE,
+                    );
+                    return false;
+                }
+            }
+            // Keyed by the vault path, like dispatch(), so the resulting watcher event is a repeat.
+            if (await this.isRepeating(pathSrc, data)) {
+                this.receiveLog(`${lp} save repeating`);
+                return false;
+            }
             const dirName = dirname(path);
             try {
                 await Deno.mkdir(dirName, { recursive: true });
@@ -57,13 +89,8 @@ export class PeerStorage extends Peer {
                 console.log(ex);
             }
             const fp = await Deno.open(path, { read: true, write: true, create: true });
-            if (data.data instanceof Uint8Array) {
-                const writtensize = await fp.write(data.data);
-                await fp.truncate(writtensize);
-            } else {
-                const writtensize = await fp.write(new TextEncoder().encode(getDocData(data.data)));
-                await fp.truncate(writtensize);
-            }
+            const writtensize = await fp.write(incoming);
+            await fp.truncate(writtensize);
             await fp.utime(new Date(data.mtime), new Date(data.mtime));
             fp.close();
             this.receiveLog(`${lp} saved`);
@@ -170,6 +197,7 @@ export class PeerStorage extends Peer {
     async dispatch(pathSrc: string) {
         const lP = this.toStoragePath(this.toLocalPath("."));
         const path = this.toPosixPath(relative(lP, pathSrc));
+        if (this.isOutsideBaseDir(path)) return;
 
         const data = await this.get(path);
 
@@ -191,6 +219,7 @@ export class PeerStorage extends Peer {
     async dispatchDeleted(pathSrc: string) {
         const lP = this.toStoragePath(this.toLocalPath("."));
         const path = this.toPosixPath(relative(lP, pathSrc));
+        if (this.isOutsideBaseDir(path)) return;
         await scheduleOnceIfDuplicated(pathSrc, async () => {
             await delay(250);
             if (!await this.isRepeating(path, false)) {
@@ -201,10 +230,30 @@ export class PeerStorage extends Peer {
 
     }
 
+    // A change outside this peer's baseDir must never reach the hub: "../Other/note.md" would be
+    // joined onto the other peers' baseDir and change a note outside their folder. Deno 2.6.9's
+    // watchFs delivers remove events of one watcher to every other watcher in the process.
+    isOutsideBaseDir(path: string) {
+        // Backslashes are filename characters on POSIX and separators on Windows.
+        const hasParentPrefix = path === ".." || path.startsWith("../") ||
+            (SEPARATOR === "\\" && path.startsWith("..\\"));
+        if (hasParentPrefix || isAbsolute(path)) {
+            this.debugLog(`Ignored a change outside the base directory: ${path}`);
+            return true;
+        }
+        return false;
+    }
+    // Vault paths always use "/". On Windows, posixFormat(parse()) only converts the separator
+    // before the file name ("a\b\c.md" -> "a\b/c.md"), so convert every separator instead.
     toPosixPath(path: string) {
-        const ret = posixFormat(parse(path));
+        const ret = this.pathSeparator === "/" ? posixFormat(parse(path)) : path.replaceAll(this.pathSeparator, "/");
         // this.debugLog(`**TOPOSIX ${path} -> ${ret}`)
         return ret;
+    }
+    // On Windows, a vault path containing "\" (a file name with a backslash, or "a\b/c.md"
+    // as written by earlier versions) resolves to a different file: never write or delete it.
+    isUnsafeVaultPath(path: string) {
+        return this.pathSeparator !== "/" && path.includes(this.pathSeparator);
     }
     toStoragePath(path: string) {
         const ret = resolve(format(posixParse(path)));
@@ -359,6 +408,19 @@ export class PeerStorage extends Peer {
         })
         watcher.on("unlink", async (path) => {
             const ePath = this.toPosixPath(relative(this.toLocalPath("."), path));
+            // Confirm that the path is absent before propagating a deletion.
+            // Permission and I/O errors do not establish that the file is gone.
+            try {
+                await Deno.stat(path);
+                this.debugLog(`Unlink ignored, file still exists: ${ePath}`);
+                return;
+            } catch (ex) {
+                if (!(ex instanceof Deno.errors.NotFound)) {
+                    this.normalLog(`Unlink verification failed: ${ePath}`, LOG_LEVEL_NOTICE);
+                    Logger(ex, LOG_LEVEL_VERBOSE);
+                    return;
+                }
+            }
             this.debugLog(`Unlink detected: ${ePath}`);
             await this.dispatchDeleted(path)
         })
